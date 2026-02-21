@@ -1,0 +1,114 @@
+#!/bin/bash
+
+
+set -euo pipefail
+
+###############################################################################
+# KONFIGURATION
+###############################################################################
+
+API_TOKEN="TOKEN-HERE"
+FIREWALL_NAME="firewall-1"
+
+RULE_DESCRIPTION="SSH:ALLOW-MY-PUBLIC-IP"  # dient als eindeutiger Schlüssel zum Überschreiben
+#IP_INPUT="1.1.1.1"   # einzelne IP oder CIDR (z.B. 203.0.113.0/24); Nur Test
+PROTOCOL="tcp"            # tcp | udp | icmp
+PORT="2221"                 # bei icmp wird PORT ignoriert
+
+USE_IPV6=false      # true = öffentliche IPv6 verwenden, sonst IPv4
+
+###############################################################################
+# AB HIER KEINE ANPASSUNGEN NOTWENDIG
+###############################################################################
+
+HCLOUD_API="https://api.hetzner.cloud/v1"
+
+die() { echo "ERROR: $*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "Missing dependency: $1"; }
+
+need curl
+need jq
+
+[[ -n "$API_TOKEN" ]]        || die "API_TOKEN not set"
+[[ -n "$FIREWALL_NAME" ]]    || die "FIREWALL_NAME not set"
+[[ -n "$RULE_DESCRIPTION" ]] || die "RULE_DESCRIPTION not set"
+
+PROTOCOL="$(echo "$PROTOCOL" | tr '[:upper:]' '[:lower:]')"
+
+auth_hdr=(-H "Authorization: Bearer ${API_TOKEN}" -H "Content-Type: application/json")
+
+# Öffentliche IP ermitteln
+if [[ "$USE_IPV6" == "true" ]]; then
+  PUBLIC_IP="$(curl -fsS https://api6.ipify.org)"
+else
+  PUBLIC_IP="$(curl -fsS https://api.ipify.org)"
+fi
+[[ -n "$PUBLIC_IP" ]] || die "Failed to determine public IP"
+
+# In CIDR umwandeln
+if [[ "$PUBLIC_IP" == *:* ]]; then
+  IP_CIDR="${PUBLIC_IP}/128"
+else
+  IP_CIDR="${PUBLIC_IP}/32"
+fi
+
+# Firewall per Name abrufen
+fw_resp="$(curl --silent "${auth_hdr[@]}" \
+  "${HCLOUD_API}/firewalls?name=$(printf %s "$FIREWALL_NAME" | jq -sRr @uri)")"
+
+fw_id="$(echo "$fw_resp" | jq -r '.firewalls[0].id // empty')"
+[[ -n "$fw_id" && "$fw_id" != "null" ]] || die "Firewall not found: $FIREWALL_NAME"
+
+orig_rules="$(echo "$fw_resp" | jq '.firewalls[0].rules // []')"
+
+# Ziel-Regel-Objekt (mit description)
+if [[ "$PROTOCOL" == "icmp" ]]; then
+  desired_rule="$(jq -n \
+    --arg dir "in" \
+    --arg proto "$PROTOCOL" \
+    --arg desc "$RULE_DESCRIPTION" \
+    --arg ip "$IP_CIDR" \
+    '{direction:$dir, protocol:$proto, description:$desc, port:null, source_ips:[$ip]}')"
+else
+  desired_rule="$(jq -n \
+    --arg dir "in" \
+    --arg proto "$PROTOCOL" \
+    --arg port "$PORT" \
+    --arg desc "$RULE_DESCRIPTION" \
+    --arg ip "$IP_CIDR" \
+    '{direction:$dir, protocol:$proto, description:$desc, port:$port, source_ips:[$ip]}')"
+fi
+
+# Existiert bereits eine Regel mit derselben description? Dann überschreiben statt anlegen.
+# (Wenn mehrere Regeln die gleiche description haben, werden alle konsistent überschrieben.)
+new_rules="$(jq -n \
+  --argjson rules "$orig_rules" \
+  --argjson desired "$desired_rule" \
+  '
+  def is_target($r):
+    ($r.description? // "") == ($desired.description // "") and ($r.direction? // "") == ($desired.direction // "");
+
+  if ($rules | any(is_target(.))) then
+    $rules | map(if is_target(.) then $desired else . end)
+  else
+    $rules + [$desired]
+  end
+  ')"
+
+# Wenn sich nichts ändert, nichts tun
+if jq -e -n --argjson a "$orig_rules" --argjson b "$new_rules" '$a == $b' >/dev/null; then
+  echo "No changes needed (rule already matches current public IP: ${IP_CIDR})."
+  exit 0
+fi
+
+# set_rules überschreibt immer das komplette Ruleset
+set_resp="$(curl --silent -X POST "${auth_hdr[@]}" \
+  -d "$(jq -n --argjson rules "$new_rules" '{rules:$rules}')" \
+  "${HCLOUD_API}/firewalls/${fw_id}/actions/set_rules")"
+
+if [[ "$(echo "$set_resp" | jq -r '.error.code? // empty')" != "" ]]; then
+  echo "$set_resp" >&2
+  die "Failed to update firewall rules"
+fi
+
+echo "OK: Rule '${RULE_DESCRIPTION}' set to ${IP_CIDR} on firewall '${FIREWALL_NAME}' (${PROTOCOL}/${PORT})"

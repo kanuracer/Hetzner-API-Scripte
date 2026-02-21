@@ -10,10 +10,10 @@ set -euo pipefail
 API_TOKEN="TOKEN-HERE"
 FIREWALL_NAME="firewall-1"
 
-RULE_DESCRIPTION="SSH:ALLOW-MY-PUBLIC-IP"  # dient als eindeutiger Schlüssel zum Überschreiben
-#IP_INPUT="1.1.1.1"   # einzelne IP oder CIDR (z.B. 203.0.113.0/24); Nur Test
+RULE_DESCRIPTION="ALLOW-MY-PUBLIC-IP ON PORT"  # dient als eindeutiger Schlüssel zum Überschreiben
+#IP_INPUT="1.1.1.1"       # einzelne IP oder CIDR (z.B. 203.0.113.0/24); Nur Test
 PROTOCOL="tcp"            # tcp | udp | icmp
-PORT="2221"                 # bei icmp wird PORT ignoriert
+PORTS=("22" "80" "443")   # mehrere Ports möglich ("22" "80" "443"); bei icmp wird PORT ignoriert
 
 USE_IPV6=false      # true = öffentliche IPv6 verwenden, sonst IPv4
 
@@ -22,12 +22,38 @@ USE_IPV6=false      # true = öffentliche IPv6 verwenden, sonst IPv4
 ###############################################################################
 
 HCLOUD_API="https://api.hetzner.cloud/v1"
+REQUIRED_CMDS=("curl" "jq")
 
 die() { echo "ERROR: $*" >&2; exit 1; }
-need() { command -v "$1" >/dev/null 2>&1 || die "Missing dependency: $1"; }
 
-need curl
-need jq
+check_dependencies() {
+    MISSING=()
+
+    for cmd in "${REQUIRED_CMDS[@]}"; do
+        if ! command -v "$cmd" >/dev/null 2>&1; then
+            MISSING+=("$cmd")
+        fi
+    done
+
+    if [ ${#MISSING[@]} -ne 0 ]; then
+        echo "Missing dependencies: ${MISSING[*]}"
+        read -p "Install missing packages? (y/n): " CONFIRM
+        CONFIRM="${CONFIRM:-Y}"
+
+        if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
+            if command -v apt >/dev/null 2>&1; then
+                sudo apt update
+                sudo apt install -y "${MISSING[@]}"
+            else
+                die "Package Manager not supported"
+            fi
+        else
+            die "Aborted due to missing dependencies"
+        fi
+    fi
+}
+
+check_dependencies
 
 [[ -n "$API_TOKEN" ]]        || die "API_TOKEN not set"
 [[ -n "$FIREWALL_NAME" ]]    || die "FIREWALL_NAME not set"
@@ -61,38 +87,49 @@ fw_id="$(echo "$fw_resp" | jq -r '.firewalls[0].id // empty')"
 
 orig_rules="$(echo "$fw_resp" | jq '.firewalls[0].rules // []')"
 
-# Ziel-Regel-Objekt (mit description)
-if [[ "$PROTOCOL" == "icmp" ]]; then
-  desired_rule="$(jq -n \
+#
+# Mehrere desired rules erzeugen
+#
+
+desired_rules="$(jq -n \
     --arg dir "in" \
     --arg proto "$PROTOCOL" \
     --arg desc "$RULE_DESCRIPTION" \
     --arg ip "$IP_CIDR" \
-    '{direction:$dir, protocol:$proto, description:$desc, port:null, source_ips:[$ip]}')"
-else
-  desired_rule="$(jq -n \
-    --arg dir "in" \
-    --arg proto "$PROTOCOL" \
-    --arg port "$PORT" \
-    --arg desc "$RULE_DESCRIPTION" \
-    --arg ip "$IP_CIDR" \
-    '{direction:$dir, protocol:$proto, description:$desc, port:$port, source_ips:[$ip]}')"
-fi
+    --argjson ports "$(printf '%s\n' "${PORTS[@]}" | jq -R . | jq -s .)" \
+    '
+    if $proto == "icmp" then
+        [{
+            direction:$dir,
+            protocol:$proto,
+            description:($desc + " " + .),
+            port:null,
+            source_ips:[$ip]
+        }]
+     else
+         $ports | map({
+            direction:$dir,
+            protocol:$proto,
+            description:($desc + " " + .),
+            port: .,
+            source_ips:[$ip]
+         })
+     end
+    ')"
+
 
 # Existiert bereits eine Regel mit derselben description? Dann überschreiben statt anlegen.
 # (Wenn mehrere Regeln die gleiche description haben, werden alle konsistent überschrieben.)
 new_rules="$(jq -n \
   --argjson rules "$orig_rules" \
-  --argjson desired "$desired_rule" \
+  --argjson desired "$desired_rules" \
   '
   def is_target($r):
-    ($r.description? // "") == ($desired.description // "") and ($r.direction? // "") == ($desired.direction // "");
+    ($r.description? // "") == ($desired[0].description // "") and
+    ($r.direction? // "") == ($desired[0].direction // "");
 
-  if ($rules | any(is_target(.))) then
-    $rules | map(if is_target(.) then $desired else . end)
-  else
-    $rules + [$desired]
-  end
+  # Entferne alle bisherigen Regeln mit gleicher description
+  ($rules | map(select(is_target(.) | not))) + $desired
   ')"
 
 # Wenn sich nichts ändert, nichts tun
@@ -111,4 +148,4 @@ if [[ "$(echo "$set_resp" | jq -r '.error.code? // empty')" != "" ]]; then
   die "Failed to update firewall rules"
 fi
 
-echo "OK: Rule '${RULE_DESCRIPTION}' set to ${IP_CIDR} on firewall '${FIREWALL_NAME}' (${PROTOCOL}/${PORT})"
+echo "OK: ${#PORTS[@]} rule(s) updated for ${IP_CIDR} on firewall '${FIREWALL_NAME}'"

@@ -1,6 +1,4 @@
 #!/bin/bash
-
-
 set -euo pipefail
 
 ###############################################################################
@@ -10,12 +8,13 @@ set -euo pipefail
 API_TOKEN="TOKEN-HERE"
 FIREWALL_NAME="firewall-1"
 
-RULE_DESCRIPTION="ALLOW-MY-PUBLIC-IP ON PORT"  # dient als eindeutiger Schlüssel zum Überschreiben
-#IP_INPUT="1.1.1.1"       # einzelne IP oder CIDR (z.B. 203.0.113.0/24); Nur Test
-PROTOCOL="tcp"            # tcp | udp | icmp
-PORTS=("22" "80" "443")   # mehrere Ports möglich ("22" "80" "443"); bei icmp wird PORT ignoriert
+RULE_DESCRIPTION="ALLOW-MY-PUBLIC-IP ON"
 
-USE_IPV6=false      # true = öffentliche IPv6 verwenden, sonst IPv4
+# Format: "PORT:PROTOCOL"  z.B. "22:tcp" "53:udp"
+# Für ICMP einfach "icmp" eintragen
+PORTS_PROTO=("22:tcp" "80:tcp" "443:tcp")
+
+USE_IPV6=false   # true = öffentliche IPv6 verwenden, sonst IPv4
 
 ###############################################################################
 # AB HIER KEINE ANPASSUNGEN NOTWENDIG
@@ -59,86 +58,108 @@ check_dependencies
 [[ -n "$FIREWALL_NAME" ]]    || die "FIREWALL_NAME not set"
 [[ -n "$RULE_DESCRIPTION" ]] || die "RULE_DESCRIPTION not set"
 
-PROTOCOL="$(echo "$PROTOCOL" | tr '[:upper:]' '[:lower:]')"
-
 auth_hdr=(-H "Authorization: Bearer ${API_TOKEN}" -H "Content-Type: application/json")
 
+###############################################################################
 # Öffentliche IP ermitteln
+###############################################################################
+
 if [[ "$USE_IPV6" == "true" ]]; then
   PUBLIC_IP="$(curl -fsS https://api6.ipify.org)"
 else
   PUBLIC_IP="$(curl -fsS https://api.ipify.org)"
 fi
+
 [[ -n "$PUBLIC_IP" ]] || die "Failed to determine public IP"
 
-# In CIDR umwandeln
 if [[ "$PUBLIC_IP" == *:* ]]; then
   IP_CIDR="${PUBLIC_IP}/128"
 else
   IP_CIDR="${PUBLIC_IP}/32"
 fi
 
-# Firewall per Name abrufen
+###############################################################################
+# Firewall abrufen
+###############################################################################
+
 fw_resp="$(curl --silent "${auth_hdr[@]}" \
   "${HCLOUD_API}/firewalls?name=$(printf %s "$FIREWALL_NAME" | jq -sRr @uri)")"
+
+if [[ "$(echo "$fw_resp" | jq -r '.error.code? // empty')" != "" ]]; then
+  echo "$fw_resp" >&2
+  die "Hetzner API error while querying firewall"
+fi
 
 fw_id="$(echo "$fw_resp" | jq -r '.firewalls[0].id // empty')"
 [[ -n "$fw_id" && "$fw_id" != "null" ]] || die "Firewall not found: $FIREWALL_NAME"
 
 orig_rules="$(echo "$fw_resp" | jq '.firewalls[0].rules // []')"
 
-#
-# Mehrere desired rules erzeugen
-#
+###############################################################################
+# Desired Rules erzeugen (PORT:PROTO Format)
+###############################################################################
 
 desired_rules="$(jq -n \
-    --arg dir "in" \
-    --arg proto "$PROTOCOL" \
-    --arg desc "$RULE_DESCRIPTION" \
-    --arg ip "$IP_CIDR" \
-    --argjson ports "$(printf '%s\n' "${PORTS[@]}" | jq -R . | jq -s .)" \
-    '
-    if $proto == "icmp" then
-        [{
-            direction:$dir,
-            protocol:$proto,
-            description:($desc + " " + .),
-            port:null,
-            source_ips:[$ip]
-        }]
-     else
-         $ports | map({
-            direction:$dir,
-            protocol:$proto,
-            description:($desc + " " + .),
-            port: .,
-            source_ips:[$ip]
-         })
-     end
-    ')"
+  --arg dir "in" \
+  --arg desc "$RULE_DESCRIPTION" \
+  --arg ip "$IP_CIDR" \
+  --argjson pp "$(printf '%s\n' "${PORTS_PROTO[@]}" | jq -R . | jq -s .)" \
+  '
+  $pp
+  | map(
+      if . == "icmp" then
+        {
+          direction: $dir,
+          protocol: "icmp",
+          description: ($desc + " icmp"),
+          port: null,
+          source_ips: [$ip]
+        }
+      else
+        (split(":")) as $x
+        | if ($x | length) != 2 then
+            error("Invalid PORTS_PROTO format. Expected PORT:PROTO")
+          else
+            {
+              direction: $dir,
+              protocol: ($x[1] | ascii_downcase),
+              description: ($desc + " " + $x[0] + "/" + ($x[1] | ascii_downcase)),
+              port: $x[0],
+              source_ips: [$ip]
+            }
+          end
+      end
+    )
+  ')"
 
+###############################################################################
+# Bestehende Regeln überschreiben (anhand description)
+###############################################################################
 
-# Existiert bereits eine Regel mit derselben description? Dann überschreiben statt anlegen.
-# (Wenn mehrere Regeln die gleiche description haben, werden alle konsistent überschrieben.)
 new_rules="$(jq -n \
   --argjson rules "$orig_rules" \
   --argjson desired "$desired_rules" \
   '
   def is_target($r):
-    ($r.description? // "") == ($desired[0].description // "") and
-    ($r.direction? // "") == ($desired[0].direction // "");
+    ($desired | map(.description) | index($r.description)) != null
+    and ($r.direction? // "") == "in";
 
-  # Entferne alle bisherigen Regeln mit gleicher description
   ($rules | map(select(is_target(.) | not))) + $desired
   ')"
 
-# Wenn sich nichts ändert, nichts tun
+###############################################################################
+# Wenn keine Änderung → Exit
+###############################################################################
+
 if jq -e -n --argjson a "$orig_rules" --argjson b "$new_rules" '$a == $b' >/dev/null; then
   echo "No changes needed (rule already matches current public IP: ${IP_CIDR})."
   exit 0
 fi
 
-# set_rules überschreibt immer das komplette Ruleset
+###############################################################################
+# Rules setzen
+###############################################################################
+
 set_resp="$(curl --silent -X POST "${auth_hdr[@]}" \
   -d "$(jq -n --argjson rules "$new_rules" '{rules:$rules}')" \
   "${HCLOUD_API}/firewalls/${fw_id}/actions/set_rules")"
@@ -148,4 +169,4 @@ if [[ "$(echo "$set_resp" | jq -r '.error.code? // empty')" != "" ]]; then
   die "Failed to update firewall rules"
 fi
 
-echo "OK: ${#PORTS[@]} rule(s) updated for ${IP_CIDR} on firewall '${FIREWALL_NAME}'"
+echo "OK: ${#PORTS_PROTO[@]} rule(s) updated for ${IP_CIDR} on firewall '${FIREWALL_NAME}'"

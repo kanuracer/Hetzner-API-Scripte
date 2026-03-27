@@ -16,7 +16,7 @@ Das Skript:
 
 Typischer Use-Case: SSH/HTTP/HTTPS-Zugriff nur von deiner aktuellen IP auf Servern erlauben, ohne manuell die Firewall im Hetzner Panel anzupassen.
 
-# "DynDNS"
+# "DynDNS" Updater
 
 Bash-Script zur automatischen Aktualisierung von DNS-Einträgen bei Hetzner.
 

@@ -1,0 +1,326 @@
+#!/bin/bash
+set -Eeuo pipefail
+
+# =========================================
+# Hetzner DynDNS updater
+# für mehrere Subdomains mit IPv4 und/oder IPv6
+# =========================================
+# IPv6 aktuell ungetestet
+# DNS Zone muss angelegt sein! 
+# fehleden subdomains werden angelegt
+# =========================================
+
+# ---- Konfiguration ganz am Anfang ----
+API_TOKEN="CLOUD-API-TOKEN"
+DOMAIN="example.com"
+
+SUBDOMAINS=(
+  "sub"
+)
+
+IPV4=true   # true = aktiv; false = nicht aktiv
+IPV6=false  # true = aktiv; false = nicht aktiv
+
+TTL="60"
+COMMENT="DynDNS Update"
+
+IP4_DETECT_CMD="${IP4_DETECT_CMD:-}"
+IP6_DETECT_CMD="${IP6_DETECT_CMD:-}"
+
+API_BASE="https://api.hetzner.cloud/v1"
+
+# ---- Hilfsfunktionen ----
+log() {
+  printf '[%s] %s\n' "$(date '+%F %T')" "$*"
+}
+
+fail() {
+  log "FEHLER: $*"
+  exit 1
+}
+
+run_privileged() {
+  if [[ "${EUID}" -eq 0 ]]; then
+    "$@"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
+  else
+    fail "Für die Installation wird root oder sudo benötigt"
+  fi
+}
+
+detect_package_manager() {
+  if command -v apt-get >/dev/null 2>&1; then
+    printf 'apt-get\n'
+  elif command -v dnf >/dev/null 2>&1; then
+    printf 'dnf\n'
+  elif command -v yum >/dev/null 2>&1; then
+    printf 'yum\n'
+  elif command -v apk >/dev/null 2>&1; then
+    printf 'apk\n'
+  elif command -v pacman >/dev/null 2>&1; then
+    printf 'pacman\n'
+  elif command -v zypper >/dev/null 2>&1; then
+    printf 'zypper\n'
+  else
+    return 1
+  fi
+}
+
+install_packages() {
+  local packages=("$@")
+  local pkgmgr
+
+  pkgmgr="$(detect_package_manager)" || fail "Kein unterstützter Paketmanager gefunden. Bitte installiere manuell: ${packages[*]}"
+
+  log "Installiere fehlende Pakete über ${pkgmgr}: ${packages[*]}"
+
+  case "$pkgmgr" in
+    apt-get)
+      run_privileged apt-get update
+      run_privileged apt-get install -y "${packages[@]}"
+      ;;
+    dnf)
+      run_privileged dnf install -y "${packages[@]}"
+      ;;
+    yum)
+      run_privileged yum install -y "${packages[@]}"
+      ;;
+    apk)
+      run_privileged apk add --no-cache "${packages[@]}"
+      ;;
+    pacman)
+      run_privileged pacman -Sy --noconfirm "${packages[@]}"
+      ;;
+    zypper)
+      run_privileged zypper --non-interactive install "${packages[@]}"
+      ;;
+    *)
+      fail "Nicht unterstützter Paketmanager: ${pkgmgr}"
+      ;;
+  esac
+}
+
+ensure_required_commands() {
+  local missing_cmds=()
+  local install_pkgs=()
+
+  if ! command -v curl >/dev/null 2>&1; then
+    missing_cmds+=("curl")
+    install_pkgs+=("curl")
+  fi
+
+  if ! command -v jq >/dev/null 2>&1; then
+    missing_cmds+=("jq")
+    install_pkgs+=("jq")
+  fi
+
+  if [[ "${#missing_cmds[@]}" -eq 0 ]]; then
+    return 0
+  fi
+
+  log "Fehlende Kommandos erkannt: ${missing_cmds[*]}"
+  install_packages "${install_pkgs[@]}"
+
+  command -v curl >/dev/null 2>&1 || fail "curl konnte nicht installiert werden"
+  command -v jq >/dev/null 2>&1 || fail "jq konnte nicht installiert werden"
+}
+
+get_public_ipv4() {
+  local ip=""
+
+  if [[ -n "$IP4_DETECT_CMD" ]]; then
+    ip="$(eval "$IP4_DETECT_CMD" | tr -d '\r\n[:space:]')" || true
+  else
+    for url in \
+      "https://api.ipify.org" \
+      "https://ipv4.icanhazip.com" \
+      "https://ifconfig.me/ip"
+    do
+      ip="$(curl -4 -fsS --max-time 10 "$url" 2>/dev/null | tr -d '\r\n[:space:]')" || true
+      if [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        break
+      fi
+      ip=""
+    done
+  fi
+
+  [[ -n "$ip" ]] || fail "Öffentliche IPv4 konnte nicht ermittelt werden"
+  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || fail "Ungültige IPv4 erkannt: $ip"
+
+  printf '%s\n' "$ip"
+}
+
+get_public_ipv6() {
+  local ip=""
+
+  if [[ -n "$IP6_DETECT_CMD" ]]; then
+    ip="$(eval "$IP6_DETECT_CMD" | tr -d '\r\n[:space:]')" || true
+  else
+    for url in \
+      "https://api64.ipify.org" \
+      "https://ipv6.icanhazip.com" \
+      "https://ifconfig.me/ip"
+    do
+      ip="$(curl -6 -fsS --max-time 10 "$url" 2>/dev/null | tr -d '\r\n[:space:]')" || true
+      if [[ "$ip" == *:* ]]; then
+        break
+      fi
+      ip=""
+    done
+  fi
+
+  [[ -n "$ip" ]] || fail "Öffentliche IPv6 konnte nicht ermittelt werden"
+  [[ "$ip" == *:* ]] || fail "Ungültige IPv6 erkannt: $ip"
+
+  printf '%s\n' "$ip"
+}
+
+api_post() {
+  local path="$1"
+  local data="$2"
+
+  curl -fsS -X POST \
+    -H "Authorization: Bearer ${API_TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d "$data" \
+    "${API_BASE}${path}"
+}
+
+update_or_create_rrset() {
+  local record_name="$1"
+  local record_type="$2"
+  local current_ip="$3"
+
+  local rrset_path="/zones/${DOMAIN}/rrsets/${record_name}/${record_type}"
+  local tmpfile
+  local http_code
+  local existing_ip
+  local update_payload
+  local create_payload
+  local fqdn
+
+  tmpfile="$(mktemp)"
+
+  if [[ "$record_name" == "@" ]]; then
+    fqdn="${DOMAIN}"
+  else
+    fqdn="${record_name}.${DOMAIN}"
+  fi
+
+  http_code="$(
+    curl -sS -o "${tmpfile}" -w '%{http_code}' \
+      -H "Authorization: Bearer ${API_TOKEN}" \
+      -H "Content-Type: application/json" \
+      "${API_BASE}${rrset_path}"
+  )"
+
+  if [[ "$http_code" == "200" ]]; then
+    existing_ip="$(
+      jq -r '.rrset.records[0].value // empty' "${tmpfile}"
+    )"
+
+    if [[ -z "$existing_ip" ]]; then
+      rm -f "${tmpfile}"
+      fail "RRSet für ${fqdn} (${record_type}) gelesen, aber kein bestehender Wert gefunden"
+    fi
+
+    log "Vorhandene DNS-IP für ${fqdn} (${record_type}): ${existing_ip}"
+
+    if [[ "$existing_ip" == "$current_ip" ]]; then
+      log "Keine Änderung nötig für ${fqdn} (${record_type})."
+      rm -f "${tmpfile}"
+      return 0
+    fi
+
+    update_payload="$(jq -nc \
+      --arg value "$current_ip" \
+      --arg comment "$COMMENT" \
+      '{records:[{value:$value, comment:$comment}]}' \
+    )"
+
+    api_post "${rrset_path}/actions/set_records" "${update_payload}" >/dev/null
+    log "Record aktualisiert: ${fqdn} (${record_type}) -> ${current_ip}"
+    rm -f "${tmpfile}"
+    return 0
+
+  elif [[ "$http_code" == "404" ]]; then
+    log "RRSet für ${fqdn} (${record_type}) existiert noch nicht. Es wird neu angelegt."
+
+    create_payload="$(jq -nc \
+      --arg name "$record_name" \
+      --arg type "$record_type" \
+      --arg value "$current_ip" \
+      --arg comment "$COMMENT" \
+      --argjson ttl "$TTL" \
+      '{
+        name:$name,
+        type:$type,
+        ttl:$ttl,
+        records:[
+          {
+            value:$value,
+            comment:$comment
+          }
+        ]
+      }'
+    )"
+
+    api_post "/zones/${DOMAIN}/rrsets" "${create_payload}" >/dev/null
+    log "Record angelegt: ${fqdn} (${record_type}) -> ${current_ip}"
+    rm -f "${tmpfile}"
+    return 0
+
+  else
+    log "Unerwarteter HTTP-Status für ${fqdn} (${record_type}): ${http_code}"
+    [[ -f "${tmpfile}" ]] && cat "${tmpfile}" >&2
+    rm -f "${tmpfile}"
+    return 1
+  fi
+}
+
+# ---- Vorbedingungen ----
+ensure_required_commands
+
+[[ -n "$API_TOKEN" ]] || fail "API_TOKEN ist leer"
+[[ -n "$DOMAIN" ]] || fail "DOMAIN ist leer"
+[[ "${#SUBDOMAINS[@]}" -gt 0 ]] || fail "Keine SUBDOMAINS eingetragen"
+
+if [[ "$IPV4" != "true" && "$IPV4" != "false" ]]; then
+  fail "IPV4 muss true oder false sein"
+fi
+
+if [[ "$IPV6" != "true" && "$IPV6" != "false" ]]; then
+  fail "IPV6 muss true oder false sein"
+fi
+
+if [[ "$IPV4" != "true" && "$IPV6" != "true" ]]; then
+  fail "Mindestens eine Option muss aktiviert sein: IPV4=true und/oder IPV6=true"
+fi
+
+# ---- Öffentliche IPs holen ----
+CURRENT_IPV4=""
+CURRENT_IPV6=""
+
+if [[ "$IPV4" == "true" ]]; then
+  CURRENT_IPV4="$(get_public_ipv4)"
+  log "Ermittelte öffentliche IPv4: ${CURRENT_IPV4}"
+fi
+
+if [[ "$IPV6" == "true" ]]; then
+  CURRENT_IPV6="$(get_public_ipv6)"
+  log "Ermittelte öffentliche IPv6: ${CURRENT_IPV6}"
+fi
+
+# ---- Alle Subdomains verarbeiten ----
+for sub in "${SUBDOMAINS[@]}"; do
+  [[ -n "$sub" ]] || continue
+
+  if [[ "$IPV4" == "true" ]]; then
+    update_or_create_rrset "$sub" "A" "$CURRENT_IPV4"
+  fi
+
+  if [[ "$IPV6" == "true" ]]; then
+    update_or_create_rrset "$sub" "AAAA" "$CURRENT_IPV6"
+  fi
+done
